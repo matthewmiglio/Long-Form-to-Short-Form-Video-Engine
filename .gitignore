@@ -1,0 +1,23 @@
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+.venv/
+venv/
+
+# Generated at runtime
+transcriptions/
+
+# Video files
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+
+# Poetry
+poetry.lock
