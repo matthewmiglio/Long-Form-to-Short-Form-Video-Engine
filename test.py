@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.request
 
@@ -162,76 +163,24 @@ class TestGetTextForTimeRange(unittest.TestCase):
 # ── Segmenter tests ─────────────────────────────────────────
 
 
-class TestSegmenterChunking(unittest.TestCase):
-    def test_short_transcript_single_chunk(self):
+class TestSegmenterBoundaryMerge(unittest.TestCase):
+    def test_merge_deduplicates_nearby(self):
         from segmenter import Segmenter
 
-        seg = Segmenter(chunk_duration=600)
-        entries = parse_srt(SAMPLE_SRT)
-        chunks = seg._chunk_transcript(entries)
-        self.assertEqual(len(chunks), 1)
-        self.assertEqual(chunks[0], (0, len(entries)))
+        seg = Segmenter(boundary_merge_radius=2.0)
+        result = seg._merge_boundaries([5.0, 6.0], [5.5, 10.0], 30.0)
+        # 0.0, 5.0, (5.5 and 6.0 merged away), 10.0, 30.0
+        self.assertIn(0.0, result)
+        self.assertIn(30.0, result)
+        self.assertTrue(len(result) <= 5)
 
-    def test_long_transcript_multiple_chunks(self):
+    def test_merge_includes_endpoints(self):
         from segmenter import Segmenter
 
-        seg = Segmenter(chunk_duration=15, overlap_duration=5)
-        entries = parse_srt(SAMPLE_SRT)
-        chunks = seg._chunk_transcript(entries)
-        self.assertGreater(len(chunks), 1)
-
-
-class TestSegmenterParseLlmResponse(unittest.TestCase):
-    def test_valid_response(self):
-        from segmenter import Segmenter
-
-        seg = Segmenter()
-        entries = parse_srt(SAMPLE_SRT)
-        response = json.dumps(
-            [
-                {
-                    "start_time": 7.2,
-                    "end_time": 32.5,
-                    "description": "Funny store story",
-                }
-            ]
-        )
-        result = seg._parse_llm_response(response, entries, 38.0)
-        self.assertEqual(len(result), 1)
-        self.assertAlmostEqual(result[0]["start"], 7.2)
-        self.assertAlmostEqual(result[0]["end"], 32.5)
-
-    def test_invalid_json(self):
-        from segmenter import Segmenter
-
-        seg = Segmenter()
-        entries = parse_srt(SAMPLE_SRT)
-        result = seg._parse_llm_response("not json at all", entries, 38.0)
-        self.assertEqual(result, [])
-
-    def test_clamps_out_of_range(self):
-        from segmenter import Segmenter
-
-        seg = Segmenter()
-        entries = parse_srt(SAMPLE_SRT)
-        response = json.dumps(
-            [{"start_time": -5.0, "end_time": 100.0, "description": "test"}]
-        )
-        result = seg._parse_llm_response(response, entries, 38.0)
-        self.assertEqual(len(result), 1)
-        self.assertAlmostEqual(result[0]["start"], 0.0)
-        self.assertAlmostEqual(result[0]["end"], 38.0)
-
-    def test_skips_tiny_segments(self):
-        from segmenter import Segmenter
-
-        seg = Segmenter()
-        entries = parse_srt(SAMPLE_SRT)
-        response = json.dumps(
-            [{"start_time": 5.0, "end_time": 7.0, "description": "too short"}]
-        )
-        result = seg._parse_llm_response(response, entries, 38.0)
-        self.assertEqual(result, [])
+        seg = Segmenter(boundary_merge_radius=2.0)
+        result = seg._merge_boundaries([], [], 100.0)
+        self.assertEqual(result[0], 0.0)
+        self.assertEqual(result[-1], 100.0)
 
 
 class TestSegmenterDeduplicate(unittest.TestCase):
@@ -299,19 +248,6 @@ class TestExtractor(unittest.TestCase):
     "Ollama and/or ffmpeg not available",
 )
 class TestIntegration(unittest.TestCase):
-    def test_segmenter_with_real_llm(self):
-        from segmenter import Segmenter
-
-        seg = Segmenter()
-        entries = parse_srt(SAMPLE_SRT)
-        segments = seg.segment_transcript(entries, min_duration=10, max_duration=38)
-        self.assertIsInstance(segments, list)
-        # LLM should find at least 1 segment in this sample
-        if segments:
-            self.assertIn("start", segments[0])
-            self.assertIn("end", segments[0])
-            self.assertIn("description", segments[0])
-
     def test_scorer_with_real_llm(self):
         from scorer import Scorer
 
@@ -401,8 +337,46 @@ def extract_clip_with_overlay(video_path, start, end, output_path, label):
     return True
 
 
+def _ensure_ollama(model="gemma2:9b"):
+    """Start Ollama if not running and pull the model if needed."""
+    if not _ollama_available():
+        print("  Ollama not running, starting it...")
+        subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        for _ in range(30):
+            time.sleep(1)
+            if _ollama_available():
+                break
+        else:
+            print("ERROR: Could not start Ollama after 30s. Install from https://ollama.com")
+            sys.exit(1)
+        print("  Ollama is up.")
+
+    # Check if model is available, pull if not
+    try:
+        req = urllib.request.Request("http://localhost:11434/api/tags")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            model_names = [m["name"] for m in data.get("models", [])]
+    except Exception:
+        model_names = []
+
+    # Match on base name (e.g. "gemma2:9b" matches "gemma2:9b")
+    if not any(model in name for name in model_names):
+        print(f"  Model '{model}' not found locally, pulling (this may take a while)...")
+        result = subprocess.run(["ollama", "pull", model], capture_output=False)
+        if result.returncode != 0:
+            print(f"ERROR: Failed to pull model '{model}'.")
+            sys.exit(1)
+        print(f"  Model '{model}' ready.")
+
+
 def run_e2e(video_path, output_dir="output_folder"):
-    """Run the full pipeline on a video and export top 3 + bottom 3 clips."""
+    """Run the full pipeline on a video and export top 5 + bottom 5 clips."""
     from transcriber import Transcriber
     from segmenter import Segmenter
     from scorer import Scorer
@@ -412,6 +386,10 @@ def run_e2e(video_path, output_dir="output_folder"):
     print("=" * 60)
     print(f"Input:  {video_path}")
     print(f"Output: {output_dir}")
+
+    # Ensure Ollama is running and model is available
+    print("\n[0/4] Checking Ollama...")
+    _ensure_ollama()
 
     # Clean output dir
     if os.path.exists(output_dir):
@@ -429,14 +407,14 @@ def run_e2e(video_path, output_dir="output_folder"):
         print("ERROR: No speech detected. Aborting.")
         sys.exit(1)
 
-    # 2) Segment
-    print("\n[2/4] Segmenting (LLM)...")
+    # 2) Segment (scene detection + silence detection + LLM filter)
+    print("\n[2/4] Segmenting (scene + silence + LLM)...")
     segmenter = Segmenter()
-    segments = segmenter.segment_transcript(parsed_srt, min_duration=15, max_duration=60)
+    segments = segmenter.segment_transcript(video_path, parsed_srt, min_duration=15, max_duration=60)
     print(f"  Found {len(segments)} segments")
 
-    if len(segments) < 6:
-        print(f"  WARNING: Only {len(segments)} segments found (need 6 for top3+bottom3).")
+    if len(segments) < 10:
+        print(f"  WARNING: Only {len(segments)} segments found (need 10 for top5+bottom5).")
         print("  Will use as many as available.")
 
     if not segments:
@@ -457,8 +435,8 @@ def run_e2e(video_path, output_dir="output_folder"):
     print("\n[4/4] Ranking and exporting clips...")
     ranked = sorted(scored, key=lambda s: s["scores"]["total"], reverse=True)
 
-    top_n = min(3, len(ranked))
-    bottom_n = min(3, len(ranked) - top_n)
+    top_n = min(5, len(ranked))
+    bottom_n = min(5, len(ranked) - top_n)
 
     top = ranked[:top_n]
     bottom = ranked[-bottom_n:] if bottom_n > 0 else []

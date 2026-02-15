@@ -1,25 +1,26 @@
 import json
+import re
+import subprocess
 import urllib.request
-from utils import format_transcript_for_llm, get_text_for_time_range
+from utils import get_text_for_time_range
 
 
-SEGMENTATION_PROMPT = """You are analyzing a video transcript to identify the best self-contained moments for short-form clips.
+FILTER_PROMPT = """You are selecting the best short-form video clips from a longer video.
 
-Find segments that are between {min_duration} and {max_duration} seconds long. Each segment must:
-1. Contain a complete thought, story, joke, argument, or emotional moment
-2. Start and end at natural speech boundaries (not mid-sentence)
-3. Work as a standalone clip without needing prior context
-4. Be interesting, dramatic, funny, or emotionally compelling
+Below are {count} candidate segments. Each segment starts and ends at a natural
+boundary (audio pause or scene change), so clips won't cut off mid-sentence.
 
-Transcript with timestamps:
-{transcript}
+{candidates_text}
 
-Output a JSON array of segments. Each segment has:
-- "start_time": start timestamp in seconds (float)
-- "end_time": end timestamp in seconds (float)
-- "description": one-sentence summary of the moment
+Select the {top_k} most compelling segments for short-form clips. Prioritize:
+1. Complete, self-contained stories, jokes, arguments, or emotional moments
+2. Strong opening hooks that grab attention immediately
+3. Drama, humor, conflict, or emotional resonance
+4. Works WITHOUT any prior context
 
-Output ONLY valid JSON, nothing else."""
+Return a JSON object with a "selected" field containing an array of segment numbers.
+Example: {{"selected": [3, 7, 12]}}
+Output ONLY valid JSON."""
 
 
 class Segmenter:
@@ -27,91 +28,268 @@ class Segmenter:
         self,
         ollama_url="http://localhost:11434/api/generate",
         model="gemma2:9b",
-        chunk_duration=600.0,
-        overlap_duration=30.0,
+        scene_threshold=0.3,
+        silence_noise_db=-30,
+        silence_min_duration=0.5,
+        boundary_merge_radius=2.0,
     ):
         self.ollama_url = ollama_url
         self.model = model
-        self.chunk_duration = chunk_duration
-        self.overlap_duration = overlap_duration
+        self.scene_threshold = scene_threshold
+        self.silence_noise_db = silence_noise_db
+        self.silence_min_duration = silence_min_duration
+        self.boundary_merge_radius = boundary_merge_radius
 
-    def segment_transcript(self, parsed_srt, min_duration=20.0, max_duration=40.0):
+    def segment_transcript(
+        self, video_path, parsed_srt, min_duration=15.0, max_duration=60.0
+    ):
         """
-        Identify natural 20-40s moments in a transcript using an LLM.
-        Returns list of dicts: [{start, end, description, text}, ...]
+        Two-pass segmentation:
+          Pass 1 — ffmpeg scene + silence detection → natural boundary points
+          Pass 2 — generate candidate segments from boundary pairs
+          Pass 3 — LLM filters to the best candidates
         """
         if not parsed_srt:
             return []
 
         total_duration = parsed_srt[-1]["end"]
-        chunks = self._chunk_transcript(parsed_srt)
 
-        all_segments = []
-        for chunk_start_idx, chunk_end_idx in chunks:
-            transcript_text = format_transcript_for_llm(
-                parsed_srt, chunk_start_idx, chunk_end_idx
+        # Pass 1: detect natural boundaries
+        print("    Detecting scene changes...")
+        scene_times = self._detect_scenes(video_path)
+        print(f"    Found {len(scene_times)} scene changes")
+
+        print("    Detecting silence gaps...")
+        silence_times = self._detect_silences(video_path)
+        print(f"    Found {len(silence_times)} silence points")
+
+        boundaries = self._merge_boundaries(
+            scene_times, silence_times, total_duration
+        )
+        print(f"    {len(boundaries)} boundary points after merging")
+
+        # Pass 2: build candidate segments
+        candidates = self._build_candidates(
+            boundaries, parsed_srt, min_duration, max_duration
+        )
+        print(f"    Generated {len(candidates)} candidate segments")
+
+        if not candidates:
+            return []
+
+        # Pass 3: LLM selects best candidates
+        print("    LLM filtering candidates...")
+        selected = self._llm_filter(candidates, max_results=20)
+        print(f"    Selected {len(selected)} segments")
+
+        selected = self._deduplicate(selected)
+        return selected
+
+    # ── ffmpeg detection ─────────────────────────────────────
+
+    def _detect_scenes(self, video_path):
+        """Use ffmpeg scene-change detection (visual cuts)."""
+        vf = f"fps=2,select=gt(scene\\,{self.scene_threshold}),showinfo"
+        cmd = [
+            "ffmpeg", "-i", video_path,
+            "-vf", vf,
+            "-vsync", "vfr", "-an",
+            "-f", "null", "-",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600
             )
-            prompt = SEGMENTATION_PROMPT.format(
-                min_duration=int(min_duration),
-                max_duration=int(max_duration),
-                transcript=transcript_text,
-            )
-            response = self._call_ollama(prompt)
-            if response is None:
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return []
+
+        times = []
+        for line in result.stderr.split("\n"):
+            if "showinfo" not in line.lower():
                 continue
-            segments = self._parse_llm_response(response, parsed_srt, total_duration)
-            all_segments.extend(segments)
+            m = re.search(r"pts_time:\s*([0-9.]+)", line)
+            if m:
+                times.append(float(m.group(1)))
+        return times
 
-        # Deduplicate overlapping segments from chunk boundaries
-        all_segments = self._deduplicate(all_segments)
+    def _detect_silences(self, video_path):
+        """Use ffmpeg silence detection to find natural speech pauses."""
+        af = (
+            f"silencedetect=noise={self.silence_noise_db}dB"
+            f":d={self.silence_min_duration}"
+        )
+        cmd = [
+            "ffmpeg", "-i", video_path,
+            "-af", af,
+            "-vn", "-f", "null", "-",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return []
 
-        # Attach full text to each segment
-        for seg in all_segments:
-            seg["text"] = get_text_for_time_range(parsed_srt, seg["start"], seg["end"])
+        times = []
+        for line in result.stderr.split("\n"):
+            # silence_end = where speech resumes (good clip-start point)
+            m = re.search(r"silence_end:\s*([0-9.]+)", line)
+            if m:
+                times.append(float(m.group(1)))
+            # silence_start = where speech stops (good clip-end point)
+            m = re.search(r"silence_start:\s*([0-9.]+)", line)
+            if m:
+                times.append(float(m.group(1)))
+        return times
 
-        return all_segments
+    # ── boundary merging ─────────────────────────────────────
 
-    def _chunk_transcript(self, parsed_srt):
-        """Split transcript into overlapping index ranges for LLM processing."""
-        total_duration = parsed_srt[-1]["end"]
-        if total_duration <= self.chunk_duration:
-            return [(0, len(parsed_srt))]
+    def _merge_boundaries(self, scene_times, silence_times, total_duration):
+        """Merge all boundary points, deduplicate within merge_radius."""
+        all_times = sorted(
+            set([0.0] + scene_times + silence_times + [total_duration])
+        )
+        if len(all_times) <= 2:
+            return all_times
 
-        chunks = []
-        chunk_start_time = 0.0
-        while chunk_start_time < total_duration:
-            chunk_end_time = chunk_start_time + self.chunk_duration
+        merged = [all_times[0]]
+        for t in all_times[1:]:
+            if t - merged[-1] >= self.boundary_merge_radius:
+                merged.append(t)
 
-            start_idx = 0
-            for i, entry in enumerate(parsed_srt):
-                if entry["start"] >= chunk_start_time:
-                    start_idx = i
+        # Ensure video end is included
+        if merged[-1] < total_duration - 1.0:
+            merged.append(total_duration)
+
+        return merged
+
+    # ── candidate generation ─────────────────────────────────
+
+    def _build_candidates(
+        self, boundaries, parsed_srt, min_dur, max_dur, max_candidates=100
+    ):
+        """Generate candidate segments from boundary pairs, pre-ranked by heuristic."""
+        candidates = []
+        target_dur = (min_dur + max_dur) / 2
+
+        for i, start in enumerate(boundaries):
+            for j in range(i + 1, len(boundaries)):
+                end = boundaries[j]
+                dur = end - start
+                if dur < min_dur:
+                    continue
+                if dur > max_dur:
                     break
 
-            end_idx = len(parsed_srt)
-            for i, entry in enumerate(parsed_srt):
-                if entry["start"] >= chunk_end_time:
-                    end_idx = i
-                    break
+                text = get_text_for_time_range(parsed_srt, start, end)
+                if not text.strip():
+                    continue
 
-            if start_idx < end_idx:
-                chunks.append((start_idx, end_idx))
+                # Heuristic pre-score: prefer speech-dense segments near target duration
+                word_count = len(text.split())
+                word_density = word_count / dur if dur > 0 else 0
+                duration_score = 1.0 - abs(dur - target_dur) / target_dur
+                pre_score = word_density * 0.7 + duration_score * 0.3
 
-            chunk_start_time += self.chunk_duration - self.overlap_duration
+                candidates.append({
+                    "start": round(start, 2),
+                    "end": round(end, 2),
+                    "text": text,
+                    "description": "",
+                    "_score": pre_score,
+                })
 
-        return chunks
+        # Keep top candidates by heuristic
+        if len(candidates) > max_candidates:
+            candidates.sort(key=lambda c: c["_score"], reverse=True)
+            candidates = candidates[:max_candidates]
+
+        for c in candidates:
+            del c["_score"]
+
+        return candidates
+
+    # ── LLM filtering ────────────────────────────────────────
+
+    def _llm_filter(self, candidates, max_results=20, batch_size=25):
+        """Send candidate batches to LLM, keep the best ones."""
+        if len(candidates) <= max_results:
+            for c in candidates:
+                if not c["description"]:
+                    c["description"] = c["text"][:100]
+            return candidates
+
+        selected = []
+        picks_per_batch = max(
+            2, (max_results * batch_size) // len(candidates) + 1
+        )
+
+        for batch_start in range(0, len(candidates), batch_size):
+            batch = candidates[batch_start : batch_start + batch_size]
+            picked_indices = self._llm_pick_best(batch, picks_per_batch)
+            for idx in picked_indices:
+                if 0 <= idx < len(batch):
+                    seg = batch[idx]
+                    if not seg["description"]:
+                        seg["description"] = seg["text"][:100]
+                    selected.append(seg)
+
+        return selected[:max_results]
+
+    def _llm_pick_best(self, candidates, top_k):
+        """Ask LLM to pick the top_k most interesting candidates from a batch."""
+        lines = []
+        for i, c in enumerate(candidates, 1):
+            dur = c["end"] - c["start"]
+            m_s, s_s = divmod(int(c["start"]), 60)
+            m_e, s_e = divmod(int(c["end"]), 60)
+            snippet = c["text"][:300]
+            lines.append(
+                f"Segment {i}: [{m_s}:{s_s:02d} - {m_e}:{s_e:02d}] ({dur:.0f}s)\n"
+                f"  {snippet}"
+            )
+
+        prompt = FILTER_PROMPT.format(
+            count=len(candidates),
+            top_k=top_k,
+            candidates_text="\n\n".join(lines),
+        )
+
+        response = self._call_ollama(prompt)
+        if response is None:
+            return list(range(min(top_k, len(candidates))))
+
+        try:
+            data = json.loads(response)
+            if isinstance(data, dict):
+                for key in ("selected", "segments", "results", "indices"):
+                    if key in data and isinstance(data[key], list):
+                        data = data[key]
+                        break
+                else:
+                    return list(range(min(top_k, len(candidates))))
+            if isinstance(data, list):
+                return [
+                    int(x) - 1
+                    for x in data
+                    if isinstance(x, (int, float))
+                ]
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        return list(range(min(top_k, len(candidates))))
+
+    # ── Ollama call ──────────────────────────────────────────
 
     def _call_ollama(self, prompt):
-        """Call Ollama API. Returns parsed response string or None."""
-        payload = json.dumps(
-            {
-                "model": self.model,
-                "prompt": prompt,
-                "stream": False,
-                "format": "json",
-                "options": {"num_gpu": 0},
-            }
-        ).encode("utf-8")
+        """Call Ollama API and return the response string."""
+        payload = json.dumps({
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "options": {"num_gpu": 0},
+        }).encode("utf-8")
 
         try:
             req = urllib.request.Request(
@@ -123,71 +301,31 @@ class Segmenter:
                 result = json.loads(resp.read().decode("utf-8"))
                 return result["response"]
         except Exception as e:
-            print(f"Segmentation LLM call failed: {e}")
+            print(f"    LLM call failed: {e}")
             return None
 
-    def _parse_llm_response(self, response, parsed_srt, total_duration):
-        """Parse LLM JSON response and validate timestamps."""
-        try:
-            data = json.loads(response)
-        except json.JSONDecodeError:
-            print(f"Failed to parse segmentation JSON: {response[:200]}")
-            return []
-
-        # Handle both direct array and wrapped object
-        if isinstance(data, dict):
-            for key in ("segments", "results", "clips", "moments"):
-                if key in data and isinstance(data[key], list):
-                    data = data[key]
-                    break
-            else:
-                return []
-
-        if not isinstance(data, list):
-            return []
-
-        segments = []
-        for item in data:
-            try:
-                start = float(item.get("start_time", 0))
-                end = float(item.get("end_time", 0))
-                description = str(item.get("description", ""))
-            except (TypeError, ValueError):
-                continue
-
-            # Clamp to valid range
-            start = max(0.0, min(start, total_duration))
-            end = max(0.0, min(end, total_duration))
-            if end <= start or (end - start) < 5.0:
-                continue
-
-            segments.append(
-                {"start": start, "end": end, "description": description}
-            )
-
-        return segments
+    # ── deduplication ────────────────────────────────────────
 
     def _deduplicate(self, segments):
-        """Remove segments that overlap >50% with a higher-ranked earlier segment."""
+        """Remove segments that overlap >50% with a higher-ranked earlier one."""
         if len(segments) <= 1:
             return segments
 
-        # Sort by start time
         segments.sort(key=lambda s: s["start"])
         kept = [segments[0]]
 
         for seg in segments[1:]:
-            overlap = False
+            dominated = False
             for existing in kept:
                 overlap_start = max(seg["start"], existing["start"])
                 overlap_end = min(seg["end"], existing["end"])
                 if overlap_end > overlap_start:
-                    overlap_duration = overlap_end - overlap_start
-                    seg_duration = seg["end"] - seg["start"]
-                    if overlap_duration / seg_duration > 0.5:
-                        overlap = True
+                    overlap_dur = overlap_end - overlap_start
+                    seg_dur = seg["end"] - seg["start"]
+                    if overlap_dur / seg_dur > 0.5:
+                        dominated = True
                         break
-            if not overlap:
+            if not dominated:
                 kept.append(seg)
 
         return kept

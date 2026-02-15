@@ -31,6 +31,7 @@ def run_pipeline(args):
     print("\n[2/5] Identifying natural moments...")
     segmenter = Segmenter()
     segments = segmenter.segment_transcript(
+        args.video_path,
         parsed_srt,
         min_duration=args.min_duration,
         max_duration=args.max_duration,
